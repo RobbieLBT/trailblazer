@@ -1,0 +1,90 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+wheels/
+*.whl
+.installed.cfg
+pip-log.txt
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Jupyter / IPython ─────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Geospatial / data files ───────────────────────────────────────────────────
+# Shapefiles and sidecars — check in only if you want them source-controlled;
+# large datasets should live in object storage (S3, GCS) and be downloaded at
+# runtime via a setup script.
+*.shp
+*.dbf
+*.shx
+*.prj
+*.cpg
+*.qpj
+*.sbn
+*.sbx
+*.fbn
+*.fbx
+*.atx
+*.ixs
+*.mxs
+*.xml.aux
+*.aux.xml
+
+# GeoTIFF / raster
+*.tif
+*.tiff
+*.geotiff
+
+# GeoPackage / SQLite / DuckDB
+*.gpkg
+*.sqlite
+*.db
+*.duckdb
+
+# ── Tiles / cache ─────────────────────────────────────────────────────────────
+tiles/
+tile_cache/
+*.mbtiles
+*.pmtiles
+
+# ── Secrets / credentials ─────────────────────────────────────────────────────
+.env
+.env.*
+secrets.toml
+*.pem
+*.key
+
+# ── Streamlit ─────────────────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── OS noise ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editors ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Testing / coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/

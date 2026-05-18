@@ -1,0 +1,7 @@
+[server]
+# Raise above the 200 MB default — the graph network is now served as PNG
+# tiles (no longer embedded in the Folium HTML), so normal use stays well
+# under 200 MB.  This headroom covers large G-AIRMET overlays and future
+# weather animation snapshots.
+maxMessageSize = 300
+enableStaticServing = true   # serves app/static/ at /app/static/

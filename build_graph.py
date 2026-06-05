@@ -20,6 +20,10 @@ python build_graph.py --graph transmission --elevation --no-elev-cache
 
 # Denser cell mesh
 python build_graph.py --graph cell --cell-grid-km 12.5 --cell-max-edge 40 --elevation
+
+# Cell mesh with population scoring
+python build_graph.py --graph cell --elevation --airspace --operating-alt 350 \
+    --landscan data/population/landscan-mosaic-unitedstates-v1-assets/landscan-mosaic-unitedstates-v1.tif
 """
 
 from __future__ import annotations
@@ -90,6 +94,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                    dest="cell_max_edge",
                    help="Max Delaunay edge length for cell tower mesh (km). "
                         "Default 60.0. Reduce to 40 when using a denser grid.")
+
+    # ── Population scoring ─────────────────────────────────────────────────
+    p.add_argument("--landscan", default=None, metavar="TIF",
+                   help="Path to LandScan USA GeoTIFF for population impact "
+                        "scoring. Stores raw pop_sum on every edge at build time; "
+                        "the Noise λ_n slider in the app activates it. "
+                        "Example: data/population/landscan-mosaic-unitedstates"
+                        "-v1-assets/landscan-mosaic-unitedstates-v1.tif")
 
     return p.parse_args(argv)
 
@@ -197,6 +209,8 @@ def main(argv=None) -> int:
         print(f"  cell: grid_km={args.cell_grid_km}  max_edge_km={args.cell_max_edge}")
     if args.elevation:
         print(f"  elev_cache: {elev_cache or 'disabled'}")
+    if args.landscan:
+        print(f"  landscan: {args.landscan}")
 
     graph_data_map = _load_graph_data(args)
     if not graph_data_map:
@@ -236,6 +250,14 @@ def main(argv=None) -> int:
             elev_weight=args.elev_weight,
             airspace_filter=airspace_filter,
         )
+
+        if args.landscan:
+            from trailblazer.scoring.social import compute_population_scores, generate_population_overlay
+            compute_population_scores(G, args.landscan, buffer_m=250.0)
+            overlay_png  = outdir / f"population_{name}.png"
+            overlay_meta = outdir / f"population_{name}.json"
+            generate_population_overlay(G, args.landscan, overlay_png, overlay_meta)
+
         G.graph["wx_filter"]    = args.wx_filter
         G.graph["cruise_kts"]   = args.cruise
         G.graph["graph_source"] = name

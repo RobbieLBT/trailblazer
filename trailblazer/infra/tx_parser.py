@@ -25,6 +25,12 @@ so lines sharing a substation are naturally connected without any separate
 substation layer.  For lines with blank endpoint names, a synthetic ident is
 derived from the coordinate hash.
 
+If a pre-processed GeoPackage exists at data/eia/tx_preprocessed.gpkg
+(written by preprocess_tx.py), it is used instead of the raw shapefile.
+The cache contains artifact-filtered, intersection-split LineStrings and a
+separate layer of UUID-ident passable waypoints at every crossing point.
+Delete the .gpkg to force a rebuild from raw data.
+
 Long lines (> MAX_SEGMENT_NM) are split at intermediate waypoints so the
 weather provider is sampled at fine-enough spatial resolution.  A proximity
 registry merges endpoints that are within SNAP_THRESHOLD_KM of each other,
@@ -32,8 +38,9 @@ which handles slight misalignments between adjacent line endpoints.
 
 Ident scheme
 ────────────
-    Name-derived : cleaned SUB_1 / SUB_2 text, e.g. "NORFOLK 500KV"
-    Synthetic    : "TX{hash:05d}" for lines with no substation name
+    Name-derived   : cleaned SUB_1 / SUB_2 text, e.g. "NORFOLK 500KV"
+    Synthetic      : "TX{hash:05d}" for lines with no substation name
+    Intersection   : UUID4 string for passable crossing-point waypoints
 
 airway_id encodes the nominal voltage class, e.g. "500KV", "345KV".
 voltage_kv on AirwaySegment feeds the social-impact discount table (Phase 4):
@@ -261,6 +268,127 @@ class _NodeRegistry:
         return dict(self._nodes)
 
 
+# ── Pre-processed cache loader ────────────────────────────────────────────────
+
+def _load_preprocessed(
+    gpkg_path: Path,
+    max_segment_nm:    float = MAX_SEGMENT_NM,
+    snap_threshold_km: float = SNAP_THRESHOLD_KM,
+) -> GraphData:
+    """
+    Build a GraphData from a pre-processed GeoPackage produced by
+    preprocess_tx.py.  The 'lines' layer contains cleaned, split LineStrings;
+    the optional 'intersections' layer supplies UUID-ident passable waypoints
+    at crossing points.
+
+    Processing mirrors load_transmission() from the point where raw GDF rows
+    are walked to produce nodes and AirwaySegments — artifact filtering and
+    intersection-finding already happened offline.
+    """
+    import geopandas as gpd
+
+    print(f"\n[TX Parser] Using pre-processed cache: {gpkg_path.name}")
+
+    gdf = gpd.read_file(gpkg_path, layer="lines")
+    print(f"  [TX]  {len(gdf):,} pre-processed segments")
+
+    # Pre-register intersection nodes by UUID so both split sub-edges that
+    # meet at a crossing point resolve to the same stable ident.
+    try:
+        xing_gdf = gpd.read_file(gpkg_path, layer="intersections")
+        xing_nodes: dict[tuple, str] = {}   # (rounded_lon, rounded_lat) → uuid
+        for _, xrow in xing_gdf.iterrows():
+            key = (round(xrow.geometry.x, 5), round(xrow.geometry.y, 5))
+            xing_nodes[key] = str(xrow["node_id"])
+        print(f"  [TX]  {len(xing_nodes):,} intersection nodes pre-registered")
+    except Exception:
+        xing_nodes = {}
+
+    # Column detection (same candidates as load_transmission)
+    volt_col   = _get_col(gdf, ["VOLTAGE",    "voltage",   "Voltage",  "VOLT"])
+    vclass_col = _get_col(gdf, ["VOLT_CLASS", "voltclass", "VOLTCLASS"])
+    sub1_col   = _get_col(gdf, ["SUB_1",  "sub_1",  "FROM_SUB", "FROMSUB", "from_sub"])
+    sub2_col   = _get_col(gdf, ["SUB_2",  "sub_2",  "TO_SUB",   "TOSUB",   "to_sub"])
+    state_col  = _get_col(gdf, ["STATE",  "state",  "STATE_NAME"])
+    kv_col     = _get_col(gdf, ["_kv"])
+
+    registry = _NodeRegistry(snap_threshold_km)
+
+    # Pre-register intersection nodes into the registry
+    for (ilon, ilat), iid in xing_nodes.items():
+        registry.get_or_create(ilat, ilon, name=iid)
+
+    segments: list[AirwaySegment] = []
+    added = skipped = 0
+
+    for _, row in gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            skipped += 1
+            continue
+
+        line_geoms = (
+            [geom]           if geom.geom_type == "LineString"       else
+            list(geom.geoms) if geom.geom_type == "MultiLineString"  else []
+        )
+        if not line_geoms:
+            skipped += 1
+            continue
+
+        kv = float(row[kv_col]) if kv_col and not pd.isna(row.get(kv_col, float("nan"))) else 0.0
+        airway_id = _voltage_label(kv)
+        sub1  = _clean_name(row[sub1_col])  if sub1_col  else ""
+        sub2  = _clean_name(row[sub2_col])  if sub2_col  else ""
+        state = str(row[state_col]).strip()[:2] if state_col else ""
+
+        for line in line_geoms:
+            raw_coords = list(line.coords)
+            if len(raw_coords) < 2:
+                continue
+
+            # Re-run interpolation so weather provider is sampled at fine
+            # enough spatial resolution (same as original path).
+            pts = _interpolate_line(raw_coords, max_segment_nm)
+
+            node_idents: list[str] = []
+            for i, (lon, lat) in enumerate(pts):
+                key = (round(lon, 5), round(lat, 5))
+                if key in xing_nodes:
+                    # Intersection node — use its stable UUID ident
+                    ident = xing_nodes[key]
+                    registry.get_or_create(lat, lon, name=ident)
+                    node_idents.append(ident)
+                else:
+                    name  = sub1 if i == 0 else (sub2 if i == len(pts) - 1 else "")
+                    ident = registry.get_or_create(lat, lon, name=name, state=state)
+                    node_idents.append(ident)
+
+            # Collapse consecutive duplicates (can arise after snapping)
+            deduped = [node_idents[0]]
+            for nid in node_idents[1:]:
+                if nid != deduped[-1]:
+                    deduped.append(nid)
+
+            for i in range(len(deduped) - 1):
+                segments.append(AirwaySegment(
+                    airway_id=airway_id,
+                    from_ident=deduped[i],
+                    to_ident=deduped[i + 1],
+                    seq_from=i,
+                    seq_to=i + 1,
+                    voltage_kv=kv,
+                ))
+                added += 1
+
+    fixes = registry.fixes
+    print(f"  [TX]  {len(fixes):,} nodes, {added:,} segments "
+          f"({skipped} bad-geometry skipped)")
+    print(f"\n  [TX]  Graph ready (pre-processed): {len(fixes):,} nodes, "
+          f"{len(segments):,} segments\n")
+
+    return GraphData(fixes=fixes, segments=segments, source="transmission")
+
+
 # ── Main loader ───────────────────────────────────────────────────────────────
 
 def load_transmission(
@@ -269,9 +397,14 @@ def load_transmission(
     max_segment_nm:    float = MAX_SEGMENT_NM,
     snap_threshold_km: float = SNAP_THRESHOLD_KM,
     bbox: tuple | None = None,
+    preprocessed: "str | Path | bool | None" = None,
 ) -> GraphData:
     """
     Build a GraphData from the EIA transmission lines shapefile.
+
+    If a pre-processed GeoPackage exists (written by preprocess_tx.py),
+    it is used instead of the raw shapefile.  Pass preprocessed=False to
+    force the raw path even when the cache file is present.
 
     Parameters
     ----------
@@ -285,6 +418,9 @@ def load_transmission(
                        Passed directly to pyogrio so a 42k-feature national
                        file reads only the spatial subset from disk.
                        Default covers ORF→CRW AO (VA/WV/MD/NC + 1° pad).
+    preprocessed     : path to pre-processed GeoPackage, or None to
+                       auto-detect data/eia/tx_preprocessed.gpkg, or False
+                       to skip the cache and always read raw data.
 
     Returns
     -------
@@ -296,11 +432,28 @@ def load_transmission(
     except ImportError as exc:
         raise ImportError("geopandas and shapely are required: pip install geopandas shapely") from exc
 
+    # ── Pre-processed cache check ─────────────────────────────────────────────
+    eia_dir = Path(eia_dir)
+
+    if preprocessed is False:
+        use_cache  = False
+        cache_path = None
+    elif preprocessed is not None:
+        cache_path = Path(preprocessed)
+        use_cache  = cache_path.exists()
+    else:
+        cache_path = eia_dir / "tx_preprocessed.gpkg"
+        use_cache  = cache_path.exists()
+
+    if use_cache:
+        return _load_preprocessed(cache_path, max_segment_nm, snap_threshold_km)
+
+    # ── Raw shapefile path (unchanged from original) ──────────────────────────
+
     # Default: ORF→CRW AO — VA, WV, MD, NC with 1° buffer
     if bbox is None:
         bbox = (-83.5, 36.0, -75.5, 39.5)
 
-    eia_dir  = Path(eia_dir)
     shp_path = _find_shapefile(eia_dir)
 
     print(f"\n[TX Parser] Loading: {shp_path.name}")

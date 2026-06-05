@@ -1,12 +1,30 @@
 """
-trailblazer/export/export.py — GeoJSON and mission brief outputs
+trailblazer/export/export.py — GeoJSON, KML, and mission brief outputs
 
-Three output formats from a single RouteSet:
+Four output formats from a single RouteSet:
 
   write_geojson()   GeoJSON FeatureCollection for QGIS / geojson.io / Leaflet
+  write_kml()       KML LineString for Weatherboy mission traversal
   write_brief()     Markdown mission brief for human review / PDF conversion
   to_dict()         Structured dict for downstream module consumption
                     (energy model, noise model, SIL harness, Streamlit)
+
+Weatherboy KML handoff
+──────────────────────
+write_kml() produces a KML LineString compatible with Weatherboy's
+mission/path.py parser.  Pass the output path to weatherboy via:
+
+    python3 run.py --config config/virginia.xml \\
+                   --path output/ORF_CRW_cell_rank1.kml \\
+                   --alt-agl 350 --speed-kmh 65 \\
+                   --traverse-dt 10 \\
+                   --output output/ORF_CRW_cell_rank1_forcing.csv \\
+                   --no-animate
+
+The resulting forcing CSV contains ForcingRecord fields (wind_ned, gust_ned,
+headwind_ms, crosswind_ms, delta_beta_deg, density_kgm3, flight_category) at
+--traverse-dt second intervals along the route — ready for Phase 3 vehicle
+dynamics integration.
 """
 
 from __future__ import annotations
@@ -108,6 +126,152 @@ def write_geojson(route_set: RouteSet, path: str | Path) -> Path:
         json.dump(fc, f, indent=2)
     print(f"  [Export] GeoJSON → {path}")
     return path
+
+
+# ── KML (Weatherboy mission traversal format) ─────────────────────────────────
+
+def kml_string(
+    route_set: RouteSet,
+    route_rank: int | None = 1,
+) -> str:
+    """
+    Build and return the KML document as a string without writing a file.
+
+    Use this when you need the content in memory — e.g. a Streamlit
+    download button.  write_kml() calls this internally.
+    """
+    return _build_kml_string(route_set, route_rank)
+
+
+def write_kml(
+    route_set: RouteSet,
+    path: str | Path,
+    route_rank: int | None = 1,
+) -> Path:
+    """
+    Write one or more routes as KML LineStrings for Weatherboy mission traversal.
+
+    Produces a KML 2.2 Document whose LineString format is identical to
+    Weatherboy's VA-XC1.kml reference — parsed by mission/path.py.
+
+    Parameters
+    ----------
+    route_set  : RouteSet from find_routes()
+    path       : output file path (e.g. "output/ORF_CRW_cell_rank1.kml")
+    route_rank : which route to export.  1 = optimal route (default).
+                 None = export all routes as separate Placemarks in one file.
+
+    Notes
+    ─────
+    Coordinates are written as "lon,lat,0" tuples (KML convention: lon first).
+    Altitude is MSL=0 — Weatherboy applies --alt-agl at traversal time.
+    """
+    kml = _build_kml_string(route_set, route_rank)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(kml, encoding="utf-8")
+    n = route_rank if route_rank else len(route_set.routes)
+    print(f"  [Export] KML → {path}  ({n} route(s))")
+    return path
+
+
+def _build_kml_string(
+    route_set: RouteSet,
+    route_rank: int | None = 1,
+) -> str:
+    """Internal: build the KML document string (shared by kml_string + write_kml)."""
+
+    # Select routes to export
+    if route_rank is not None:
+        routes = [r for r in route_set.routes if r.rank == route_rank]
+        if not routes:
+            raise ValueError(
+                f"Route rank {route_rank} not found in RouteSet "
+                f"(available: {[r.rank for r in route_set.routes]})"
+            )
+    else:
+        routes = route_set.routes
+
+    dep_iso = route_set.departure_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # ── KML color encoding per route rank ─────────────────────────────────
+    # KML color format: aabbggrr (alpha, blue, green, red — reversed from CSS)
+    _KML_COLORS = [
+        "ffFF8C1E",   # rank 1: blue  (#1E90FF reversed)
+        "ff00008CFF", # rank 2: orange
+        "ff71B33C",   # rank 3: green
+    ]
+
+    # ── Build Placemark blocks ─────────────────────────────────────────────
+    placemarks: list[str] = []
+
+    for r in routes:
+        coords = [
+            route_set.fixes[fid]
+            for fid in r.path
+            if fid in route_set.fixes
+        ]
+        if len(coords) < 2:
+            continue
+
+        coord_str = " ".join(
+            f"{fix.lon:.8f},{fix.lat:.8f},0"
+            for fix in coords
+        )
+
+        kml_color = _KML_COLORS[min(r.rank - 1, len(_KML_COLORS) - 1)]
+        h, m      = divmod(int(r.time_min), 60)
+        style_id  = f"route{r.rank}Style"
+
+        placemarks.append(f"""
+\t<Style id="{style_id}_normal">
+\t\t<LineStyle>
+\t\t\t<color>{kml_color}</color>
+\t\t\t<width>{max(2, 5 - r.rank)}</width>
+\t\t</LineStyle>
+\t\t<PolyStyle><color>40ffffff</color></PolyStyle>
+\t</Style>
+\t<Style id="{style_id}_highlight">
+\t\t<LineStyle>
+\t\t\t<color>{kml_color}</color>
+\t\t\t<width>{max(3, 6 - r.rank)}</width>
+\t\t</LineStyle>
+\t</Style>
+\t<StyleMap id="{style_id}">
+\t\t<Pair><key>normal</key><styleUrl>#{style_id}_normal</styleUrl></Pair>
+\t\t<Pair><key>highlight</key><styleUrl>#{style_id}_highlight</styleUrl></Pair>
+\t</StyleMap>
+\t<Placemark>
+\t\t<name>{route_set.origin}→{route_set.destination} #{r.rank} ({r.distance_nm:.0f}nm {h}h{m:02d}m)</name>
+\t\t<description>Graph: {route_set.graph_source} | Depart: {dep_iso} | Cruise: {route_set.cruise_kts:.0f}kts | Worst wx: {r.worst_wx} | Cost: {r.cost:.1f}</description>
+\t\t<styleUrl>#{style_id}</styleUrl>
+\t\t<LineString>
+\t\t\t<tessellate>1</tessellate>
+\t\t\t<coordinates>
+\t\t\t\t{coord_str}
+\t\t\t</coordinates>
+\t\t</LineString>
+\t</Placemark>""")
+
+    doc_name = (
+        f"{route_set.origin}-{route_set.destination}-{route_set.graph_source}"
+        f"-rank{route_rank}" if route_rank else
+        f"{route_set.origin}-{route_set.destination}-{route_set.graph_source}-all"
+    )
+
+    kml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"
+     xmlns:gx="http://www.google.com/kml/ext/2.2"
+     xmlns:kml="http://www.opengis.net/kml/2.2">
+<Document id="document">
+\t<name>{doc_name}</name>
+\t<description>Generated by Trailblazer {datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")} | {route_set.origin} → {route_set.destination} | {route_set.graph_source} | ≥{route_set.wx_filter}</description>
+{"".join(placemarks)}
+</Document>
+</kml>
+"""
+
+    return kml
 
 
 # ── Mission brief (Markdown) ──────────────────────────────────────────────────
@@ -223,13 +387,14 @@ def to_dict(route_set: RouteSet) -> dict[str, Any]:
                 "to_lon":      fb.lon if fb else None,
             })
         routes_out.append({
-            "rank":        r.rank,
-            "distance_nm": r.distance_nm,
-            "time_min":    r.time_min,
-            "worst_wx":    r.worst_wx,
-            "cost":        r.cost,
-            "path":        r.path,
-            "segments":    segs_out,
+            "rank":             r.rank,
+            "distance_nm":      r.distance_nm,
+            "time_min":         r.time_min,
+            "worst_wx":         r.worst_wx,
+            "cost":             r.cost,
+            "path":             r.path,
+            "segments":         segs_out,
+            "total_pop_affected": r.total_pop_affected,
         })
 
     return {

@@ -28,6 +28,10 @@ python -m trailblazer.cli --graph nasr \
 # Load pre-built graph.pkl (skips parse step — fast)
 python -m trailblazer.cli --pkl graph_transmission.pkl \
     --origin ORF --dest CRW
+
+# Export KML for Weatherboy traversal
+python cli.py --pkl graph_cell.pkl --origin ORF --dest CRW --write-kml
+# → output/ORF_CRW_cell_<date>_rank1.kml
 """
 
 from __future__ import annotations
@@ -92,6 +96,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--outdir",     default="output", metavar="DIR")
     p.add_argument("--no-geojson", action="store_true")
     p.add_argument("--no-brief",   action="store_true")
+    p.add_argument("--write-kml",  action="store_true", dest="write_kml",
+                   help="Also export rank-1 route as KML for Weatherboy "
+                        "(written to --outdir alongside GeoJSON and brief).")
 
     # NASR airway filter (nasr graph only)
     p.add_argument("--airways", default=None, metavar="V268,V20,...",
@@ -160,11 +167,13 @@ def main(argv=None) -> int:
     stem   = (f"{args.origin.upper()}_{args.dest.upper()}_"
               f"{route_set.graph_source}_{dep.strftime('%Y%m%d_%H%M')}")
 
-    from trailblazer.export.export import write_geojson, write_brief
+    from trailblazer.export.export import write_geojson, write_brief, write_kml
     if not args.no_geojson:
         write_geojson(route_set, outdir / f"{stem}.geojson")
     if not args.no_brief:
         write_brief(route_set, outdir / f"{stem}.md")
+    if args.write_kml:
+        write_kml(route_set, outdir / f"{stem}_rank1.kml", route_rank=1)
 
     _print_summary(route_set)
     return 0 if route_set.routes else 2
@@ -250,7 +259,6 @@ def _build_provider(args, graph_data):
                 _sys.path.insert(0, str(wb_path))
             from weather.fetch import fetch_metars  # noqa — weatherboy module
 
-            # Parse config for station list; use departure_time ± window for obs fetch
             tree = ET.parse(args.wb_config)
             root = tree.getroot()
             stations = [el.get("icao") for el in root.findall(".//station") if el.get("icao")]

@@ -22,8 +22,8 @@ parser.add_argument("--no-streamlit", action="store_true",
 args = parser.parse_args()
 
 graphs = [
-    ("cell",         ["--graph", "cell",         "--elevation", "--airspace", "--wx", args.wx, "--cell-grid-km", "12.5", "--cell-max-edge", "40", "--tiles"]),
-    ("transmission", ["--graph", "transmission", "--elevation", "--airspace", "--wx", args.wx, "--tiles"]),
+    ("cell",         ["--graph", "cell",         "--elevation", "--airspace", "--wx", args.wx, "--cell-grid-km", "12.5", "--cell-max-edge", "40", "--tiles", "--landscan", "data/population/landscan-mosaic-unitedstates-v1-assets/landscan-mosaic-unitedstates-v1.tif"]),
+    ("transmission", ["--graph", "transmission", "--elevation", "--airspace", "--wx", args.wx, "--tiles", "--landscan", "data/population/landscan-mosaic-unitedstates-v1-assets/landscan-mosaic-unitedstates-v1.tif"]),
 ]
 
 results = {}

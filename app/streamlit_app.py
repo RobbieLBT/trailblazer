@@ -53,12 +53,8 @@ IBM = {
     "red":     "#FA4D56",
 }
 
-# Network tile colour — all edges use this single hue; voltage encoded by
-# lineweight in tiles.py.  Keep in sync with tiles._EDGE_COLOR.
 _NETWORK_COLOR = IBM["cyan"]
 
-# VOLTAGE_COLORS kept for any fallback GeoJSON path; all set to network colour
-# so the legend can drive lineweight display without a colour mismatch.
 VOLTAGE_COLORS = {
     "765KV":      _NETWORK_COLOR,
     "500KV":      _NETWORK_COLOR,
@@ -69,7 +65,6 @@ VOLTAGE_COLORS = {
     "TOWER_MESH": _NETWORK_COLOR,
 }
 
-# Lineweights for legend swatches (px height) — must mirror tiles._BASE_LW
 _VOLTAGE_LW_PX: dict[str, int] = {
     "765KV": 4, "500KV": 3, "345KV": 3, "230KV": 2, "115KV": 2,
     "TOWER_MESH": 1,
@@ -84,11 +79,10 @@ WX_COLORS = {
     "LIFR": "#785EF0",
 }
 
-# Open-Topo-Data SRTM 30m — used for live elevation profile fetch
 _ELEV_API_URL  = "https://api.opentopodata.org/v1/srtm30m"
-_ELEV_BATCH    = 100    # hard limit per request
-_ELEV_DELAY    = 1.1    # seconds between requests (public instance rate limit)
-_ELEV_SAMPLES  = 6      # sample points per graph segment
+_ELEV_BATCH    = 100
+_ELEV_DELAY    = 1.1
+_ELEV_SAMPLES  = 6
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -118,6 +112,27 @@ with st.sidebar:
 G, graph_data = load_pkl(pkl_choice)
 has_elev_data_pre = any(f.elevation_m is not None for f in graph_data.fixes.values())
 
+# ── Population overlay (PNG + bounds sidecar, generated at build time) ────────
+# Load alongside the selected pkl: population_<name>.png + population_<name>.json
+# Encoded as base64 data URI so it works on Streamlit Cloud with no static server.
+
+@st.cache_resource
+def load_pop_overlay(png_path: Path, meta_path: Path):
+    """Load population overlay PNG as base64 data URI + bounds dict."""
+    import base64
+    import json as _json
+    if not png_path.exists() or not meta_path.exists():
+        return None, None
+    with open(png_path, "rb") as f:
+        uri = "data:image/png;base64," + base64.b64encode(f.read()).decode("utf-8")
+    meta = _json.loads(meta_path.read_text())
+    return uri, meta
+
+_graph_name_for_pop = pkl_choice.stem.replace("graph_", "")
+_pop_png  = pkl_choice.parent / f"population_{_graph_name_for_pop}.png"
+_pop_meta = pkl_choice.parent / f"population_{_graph_name_for_pop}.json"
+_pop_uri, _pop_bounds = load_pop_overlay(_pop_png, _pop_meta)
+
 with st.sidebar:
     st.header("🗺️ Route")
     origin_input = st.text_input("Origin",      "ORF",
@@ -143,12 +158,31 @@ with st.sidebar:
                             disabled=not has_elev_data,
                             help=elev_help)
 
-    noise_weight = st.slider("Noise  λ_n", 0.0, 1.0, 0.0, 0.05,
-                             help="⚠️ Pending LandScan data. Slider wired; "
-                                  "score = 0 until Phase 4.")
-    if noise_weight > 0:
-        st.caption("🔶 Noise scoring requires LandScan USA raster (Phase 4). "
-                   "Routes unchanged until data is loaded.")
+    # PATCH A — noise slider: detect pop_sum data, mirror elev_weight pattern
+    _has_pop_data = G.graph.get("pop_sum_max", 0.0) > 0.0
+    noise_label   = "Noise  λ_n" if _has_pop_data else "Noise  λ_n ⚠️ no data"
+    noise_help    = (
+        "Population impact factor. Penalises corridors over populated areas. "
+        "Score = log1p(pop_sum / cruise_kts), normalised [0,1]. "
+        "Voltage ROW discount applied automatically."
+        if _has_pop_data else
+        "⚠️ LandScan data not loaded — rebuild with "
+        "`python build_graph.py --landscan <path/to/tif>` to activate."
+    )
+    noise_weight = st.slider(
+        noise_label, 0.0, 1.0, 0.0, 0.05,
+        disabled=not _has_pop_data,
+        help=noise_help,
+    )
+
+    # Population overlay opacity — only shown when overlay PNG is available
+    pop_overlay_opacity = 0.0
+    if _pop_uri is not None:
+        pop_overlay_opacity = st.slider(
+            "Population overlay opacity", 0.0, 1.0, 0.5, 0.05,
+            help="Opacity of the LandScan population heatmap on the map. "
+                 "Yellow = sparse, red = dense. Log-scaled.",
+        )
 
     st.header("🌤️ Weather")
     wx_filter = st.select_slider(
@@ -312,16 +346,6 @@ c4.metric("Elevation coverage", f"{has_elev/max(len(graph_data.fixes),1)*100:.0f
 
 @st.cache_data(ttl=300)
 def fetch_gairmets(cache_path: str = "data/gairmets.cache.xml.gz") -> list[dict]:
-    """
-    Load G-AIRMETs from a local cache file.
-
-    Download manually from:
-        https://aviationweather.gov/data/cache/gairmets.cache.xml.gz
-    Save to data/gairmets.cache.xml.gz — updated every minute by AWC.
-    The app reloads it every 5 minutes (ttl=300).
-
-    Falls back to empty list if file not present (no crash, just no overlay).
-    """
     import gzip
     import xml.etree.ElementTree as ET
 
@@ -383,7 +407,6 @@ def fetch_gairmets(cache_path: str = "data/gairmets.cache.xml.gz") -> list[dict]
 
 
 def _gairmets_to_weather_zones(advisories: list[dict]) -> list[WeatherZone]:
-    """Convert G-AIRMET advisory dicts to WeatherZone objects."""
     _HAZARD_SEVERITY = {
         "IFR":       "IFR",
         "MTN OBSCN": "MVFR",
@@ -419,11 +442,10 @@ def _gairmets_to_weather_zones(advisories: list[dict]) -> list[WeatherZone]:
 gairmets = fetch_gairmets("data/gairmets.cache.xml.gz") if show_gairmet else []
 
 
-# ── Airspace exclusion zones (display + TFR routing) ─────────────────────────
+# ── Airspace exclusion zones ──────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
 def get_airspace_exclusion(tfr_mtime: float, operating_agl_ft: float) -> AirspaceExclusion:
-    """Cache keyed on TFR file mtime + operating altitude."""
     return load_airspace(operating_agl_ft=operating_agl_ft)
 
 
@@ -439,7 +461,6 @@ airspace_ex = (
 
 @st.cache_data(show_spinner=False)
 def get_manual_weather_zones(wz_mtime: float) -> list[WeatherZone]:
-    """Cache keyed on weather_zones.json mtime."""
     return load_weather_zones()
 
 
@@ -466,15 +487,17 @@ for _name in (origin_input, dest_input):
     except Exception:
         pass
 
+# PATCH B — add cruise_kts= so speed changes shift the noise normalisation surface
 apply_weights(
     G,
     time_weight=time_weight,
     elev_weight=elev_weight,
     noise_weight=noise_weight,
+    cruise_kts=cruise_kts,
     wx_filter=wx_filter,
     echo_penalty=float(echo_penalty),
     exempt_coords=_exempt or None,
-    exempt_radius_nm=10.0,   # tightened from 25 nm — prevents PHF/LFI/FAF pass-through
+    exempt_radius_nm=10.0,
     current_tfrs=airspace_ex.tfrs if airspace_ex else None,
     current_weather_zones=_all_weather_zones or None,
     wx_zone_severity_threshold=wx_zone_threshold,
@@ -497,6 +520,7 @@ if find_btn:
     with st.spinner("Pathfinding…"):
         rs = find_routes(G, origin_id, dest_id, graph_data, dep, cruise_kts, k_routes)
     routes = rs.routes
+    st.session_state["_route_set"] = rs   # persisted for KML download button
     status = (f"✅ {len(routes)} route(s)  ·  {origin_id!r} → {dest_id!r}"
               if routes else
               "⚠️ No routes found. The graph may be disconnected or all paths excluded.")
@@ -508,27 +532,13 @@ if status:
 # ── Elevation profile helpers ─────────────────────────────────────────────────
 
 def _fetch_elevation_profiles(routes_list, gdata) -> list[dict]:
-    """
-    Fetch SRTM 30m terrain elevation along every route in one batched pass.
-
-    Collects all interpolated sample points across all routes, batches them
-    into groups of 100 (Open-Topo-Data API hard limit), then reassembles into
-    per-route arrays.  Typical k=3 route set: 2-4 API calls, ~3-5 seconds.
-
-    Returns list of dicts, one per route:
-        dist_nm         : list[float]  cumulative distance axis (nm)
-        terrain_ft_msl  : list[float]  terrain elevation in ft MSL
-        drone_ft_msl    : list[float]  terrain + operating_agl_ft (drone MSL track)
-        waypoint_dist_nm: list[float]  cumulative distance at each graph node
-    """
     _op_ft = float(operating_alt_ft)
 
-    # ── Collect all sample points ─────────────────────────────────────────
-    all_pts: list[tuple] = []    # (lat, lon, route_idx, seg_idx, pt_idx)
-    meta: list[dict]     = []    # per-route geometry info
+    all_pts: list[tuple] = []
+    meta: list[dict]     = []
 
     for ri, route in enumerate(routes_list):
-        seg_info   = []           # (cum_dist_at_start, seg_dist_nm)
+        seg_info   = []
         wp_dists   = [0.0]
         cum        = 0.0
 
@@ -557,7 +567,6 @@ def _fetch_elevation_profiles(routes_list, gdata) -> list[dict]:
         return [{"dist_nm": [], "terrain_ft_msl": [], "drone_ft_msl": [],
                  "waypoint_dist_nm": []} for _ in routes_list]
 
-    # ── Batched API fetch ─────────────────────────────────────────────────
     elevations = [0.0] * len(all_pts)
 
     for i in range(0, len(all_pts), _ELEV_BATCH):
@@ -574,11 +583,10 @@ def _fetch_elevation_profiles(routes_list, gdata) -> list[dict]:
             for j, result in enumerate(results):
                 elevations[i + j] = float(result.get("elevation") or 0.0)
         except Exception:
-            pass   # leave zeros — don't crash, profile just shows flat
+            pass
         if i + _ELEV_BATCH < len(all_pts):
             time.sleep(_ELEV_DELAY)
 
-    # ── Build lookup and reassemble ───────────────────────────────────────
     elev_map: dict[tuple, float] = {
         (pt[2], pt[3], pt[4]): elevations[k]
         for k, pt in enumerate(all_pts)
@@ -597,8 +605,7 @@ def _fetch_elevation_profiles(routes_list, gdata) -> list[dict]:
                 t  = pi / (_ELEV_SAMPLES - 1)
                 d  = cum_d + t * seg_d
                 em = elev_map.get((ri, si, pi), 0.0)
-                ef = em * 3.28084          # metres → feet
-                # Skip duplicate boundary points between segments
+                ef = em * 3.28084
                 if dist_arr and abs(d - dist_arr[-1]) < 1e-6:
                     continue
                 dist_arr.append(round(d, 3))
@@ -622,8 +629,13 @@ def make_map(
     graph_data, G, routes, gairmets, airspace_ex,
     show_nodes, map_centre, tile_url, airways_in_graph,
     weather_zones=None,
+    pop_overlay_uri=None,
+    pop_overlay_bounds=None,
+    pop_overlay_opacity=0.5,
 ) -> folium.Map:
     m = folium.Map(location=map_centre, zoom_start=7, tiles="CartoDB positron")
+
+
 
     # ── Graph network tile layer ──────────────────────────────────────────
     if tile_url:
@@ -638,7 +650,22 @@ def make_map(
             max_zoom=18,
         ).add_to(m)
 
-    # ── Airspace exclusion zones ──────────────────────────────────────────
+    # ── Population heatmap overlay ────────────────────────────────────────
+    # Rendered in Leaflet overlayPane (z=400), above the graph tile layer
+    # (tilePane z=200).  Opacity slider controls visibility.
+    if pop_overlay_uri and pop_overlay_bounds and pop_overlay_opacity > 0:
+        bounds = pop_overlay_bounds["bounds"]
+        folium.raster_layers.ImageOverlay(
+            image=pop_overlay_uri,
+            bounds=bounds,
+            opacity=pop_overlay_opacity,
+            name="Population density",
+            overlay=True,
+            control=True,
+            cross_origin=False,
+            zindex=1,
+        ).add_to(m)
+
     if airspace_ex:
         airspace_grp = folium.FeatureGroup("Airspace zones", show=True)
         if getattr(airspace_ex, "_use_shapefile", False) and airspace_ex._gdf is not None:
@@ -702,7 +729,6 @@ def make_map(
                     tooltip=f'{zone["ident"]} · Class {zone["airspace"]}',
                 ).add_to(airspace_grp)
 
-        # TFR polygons — active only
         _now_utc = datetime.now(timezone.utc)
         for tfr in airspace_ex.tfrs:
             if tfr.end_utc and _now_utc > tfr.end_utc:
@@ -715,7 +741,6 @@ def make_map(
                 tooltip=f"TFR: {tfr.name}",
             ).add_to(airspace_grp)
 
-        # DC SFRA
         from trailblazer.airspace.exclusion import _KDCA_LAT, _KDCA_LON, _SFRA_RADIUS_NM
         folium.Circle(
             [_KDCA_LAT, _KDCA_LON],
@@ -726,7 +751,6 @@ def make_map(
         ).add_to(airspace_grp)
         airspace_grp.add_to(m)
 
-    # ── Weather exclusion zones ───────────────────────────────────────────
     if weather_zones:
         wx_zone_grp = folium.FeatureGroup("Weather Zones", show=True)
         _now_utc = datetime.now(timezone.utc)
@@ -744,7 +768,6 @@ def make_map(
             ).add_to(wx_zone_grp)
         wx_zone_grp.add_to(m)
 
-    # ── G-AIRMET overlay (display layer — independent of routing zones) ───
     if gairmets:
         wx_grp = folium.FeatureGroup("G-AIRMETs", show=True)
         for adv in gairmets:
@@ -772,7 +795,6 @@ def make_map(
                 ).add_to(wx_grp)
         wx_grp.add_to(m)
 
-    # ── Graph nodes ───────────────────────────────────────────────────────
     if show_nodes:
         node_grp = folium.FeatureGroup("Nodes", show=True)
         node_features = []
@@ -800,7 +822,6 @@ def make_map(
         ).add_to(node_grp)
         node_grp.add_to(m)
 
-    # ── Routes ────────────────────────────────────────────────────────────
     if routes:
         route_grp = folium.FeatureGroup("Routes", show=True)
         for r in routes:
@@ -826,8 +847,6 @@ def make_map(
                     ).add_to(route_grp)
         route_grp.add_to(m)
 
-    # ── Legend ────────────────────────────────────────────────────────────
-    # Network voltage encoded by lineweight (all lines same colour).
     _lw_labels = [
         ("765KV", "765 kV", 4), ("500KV", "500 kV", 3),
         ("345KV", "345 kV", 3), ("230KV", "230 kV", 2),
@@ -888,6 +907,9 @@ m = make_map(
     airspace_ex if show_airspace else None,
     show_nodes, _map_centre, _tile_url, _airways_in_graph,
     weather_zones=_all_weather_zones or None,
+    pop_overlay_uri=_pop_uri,
+    pop_overlay_bounds=_pop_bounds,
+    pop_overlay_opacity=pop_overlay_opacity,
 )
 st_folium(m, width="100%", height=640, returned_objects=[])
 
@@ -899,18 +921,40 @@ if routes:
     for r in routes:
         h, mn = divmod(int(r.time_min), 60)
         _e_pct = (r.class_e_time_min / r.time_min * 100) if r.time_min > 0 else 0
+        _pop   = f"{int(r.total_pop_affected):,}" if r.total_pop_affected > 0 else "—"
         rows.append({
-            "Rank":         f"#{r.rank}",
-            "Dist (nm)":    f"{r.distance_nm:.0f}",
-            "ETE":          f"{h}h{mn:02d}m",
-            "Cost":         f"{r.cost:.1f}",
-            "Corridors":    ", ".join(r.unique_airways[:4]),
-            "Worst Wx":     r.worst_wx,
-            "Class E time": f"{r.class_e_time_min:.0f} min ({_e_pct:.0f}%)",
-            "Climb (m)":    f"{r.total_climb_m:.0f}" if r.total_climb_m else "—",
-            "Waypoints":    len(r.path),
+            "Rank":           f"#{r.rank}",
+            "Dist (nm)":      f"{r.distance_nm:.0f}",
+            "ETE":            f"{h}h{mn:02d}m",
+            "Cost":           f"{r.cost:.1f}",
+            "People (250m)":  _pop,
+            "Corridors":      ", ".join(r.unique_airways[:4]),
+            "Worst Wx":       r.worst_wx,
+            "Class E time":   f"{r.class_e_time_min:.0f} min ({_e_pct:.0f}%)",
+            "Climb (m)":      f"{r.total_climb_m:.0f}" if r.total_climb_m else "—",
+            "Waypoints":      len(r.path),
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ── KML download for Weatherboy ──────────────────────────────────────────
+    # kml_string() builds the KML in memory; no file is written until the user
+    # clicks download.  Route set is persisted in session_state so the button
+    # remains active after slider moves that re-render the page.
+    _stored_rs = st.session_state.get("_route_set")
+    if _stored_rs is not None and _stored_rs.routes:
+        from trailblazer.export.export import kml_string as _kml_string
+        _kml_data = _kml_string(_stored_rs, route_rank=1)
+        _o = _stored_rs.origin
+        _d = _stored_rs.destination
+        st.download_button(
+            label="⬇ Download KML — rank-1 route (Weatherboy)",
+            data=_kml_data,
+            file_name=f"{_o}_{_d}_{_graph_name}_rank1.kml",
+            mime="application/vnd.google-earth.kml+xml",
+            help="KML LineString for Weatherboy --path flag:"
+                 "python3 run.py --config config/virginia.xml "
+                 "--path <file.kml> --alt-agl 350 --speed-kmh 65",
+        )
 
     with st.expander("Segment detail — Route #1"):
         segs = []
@@ -931,9 +975,6 @@ if routes:
 
 
 # ── Elevation profile ─────────────────────────────────────────────────────────
-# Profiles are fetched once when Find Routes is clicked and persisted in
-# session_state so they survive subsequent slider moves (which re-render the
-# app but don't re-click the button).
 
 if find_btn and routes:
     _prof_key = (origin_id, dest_id)
@@ -949,7 +990,6 @@ _elev_routes   = st.session_state.get("_elev_routes")
 
 if _elev_profiles and _elev_routes:
     with st.expander("📈 Terrain profile", expanded=True):
-        # Route selector — only shown when k > 1
         if len(_elev_routes) > 1:
             _r_label = st.selectbox(
                 "Route",
@@ -977,10 +1017,9 @@ if _elev_profiles and _elev_routes:
                 _df = pd.DataFrame({
                     "Distance (nm)":        _dist,
                     "Terrain (ft MSL)":     _terr,
-                    "Drone track (ft MSL)": _drone,   # terrain + operating AGL
+                    "Drone track (ft MSL)": _drone,
                 })
 
-                # Terrain filled area
                 _base = alt.Chart(_df).encode(
                     x=alt.X("Distance (nm):Q",
                             axis=alt.Axis(title="Distance (nm)", grid=False)),
@@ -998,7 +1037,6 @@ if _elev_profiles and _elev_routes:
                     ],
                 )
 
-                # Drone track dashed line
                 _drone_line = _base.mark_line(
                     color=IBM["orange"], strokeDash=[5, 3], strokeWidth=1.5,
                 ).encode(
@@ -1010,7 +1048,6 @@ if _elev_profiles and _elev_routes:
                     ],
                 )
 
-                # Waypoint tick marks
                 _layers = [_terrain_area, _drone_line]
                 if _wp_dist:
                     _wp_df = pd.DataFrame({"Distance (nm)": _wp_dist})
@@ -1030,14 +1067,12 @@ if _elev_profiles and _elev_routes:
                 st.altair_chart(_chart, use_container_width=True)
 
             except ImportError:
-                # Altair not available — fall back to st.line_chart
                 _df_simple = pd.DataFrame({
                     "Terrain (ft MSL)":     _prof["terrain_ft_msl"],
                     "Drone track (ft MSL)": _prof["drone_ft_msl"],
                 }, index=_prof["dist_nm"])
                 st.line_chart(_df_simple)
 
-            # Summary stats
             _max_t   = max(_prof["terrain_ft_msl"]) if _prof["terrain_ft_msl"] else 0
             _max_d   = max(_prof["drone_ft_msl"])   if _prof["drone_ft_msl"]   else 0
             _min_clr = min(
@@ -1081,6 +1116,7 @@ if _active_display_zones:
             })
         st.dataframe(pd.DataFrame(wz_rows), use_container_width=True, hide_index=True)
 
+# PATCH C — updated "How sliders work" expander
 with st.expander("ℹ️ How sliders work"):
     st.markdown("""
 **Sliders recompute edge weights in-place — no graph rebuild needed.**
@@ -1092,7 +1128,14 @@ When you move a slider, `apply_weights(G, λ)` recomputes
 `weight = λ_t·time + λ_e·elev_gain + λ_n·noise + airspace_penalty`
 across all edges in milliseconds, then pathfinding re-runs on the new weights.
 
-**Noise λ_n** is wired but scores 0 until LandScan USA data is loaded (Phase 4).
+**Noise λ_n** scores population impact: `log1p(pop_sum / cruise_kts)` normalised
+to [0,1]. Requires `--landscan` at graph build time; slider is disabled until
+data is loaded. Voltage ROW discount applied automatically.
+
+**Cruise speed** affects both `time_min` per edge and the noise normalisation
+surface — changing speed immediately re-ranks corridors by exposure without
+a rebuild.
+
 **Altitude λ_e** requires elevations fetched with `python build_graph.py --elevation`.
 **Airspace** classification requires `--airspace` flag at build time.
 

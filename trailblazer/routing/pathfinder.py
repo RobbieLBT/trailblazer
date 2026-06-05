@@ -70,6 +70,7 @@ class Route:
 
     class_e_time_min: float = 0.0   # minutes in Class E airspace (incursion metric)
     total_climb_m:    float = 0.0   # total ascent in metres (climb metric)
+    total_pop_affected: float = 0.0 # sum of pop_sum along route corridor (raw, not normalised)
 
     @property
     def path(self) -> list[str]:
@@ -192,6 +193,8 @@ def build_graph(
     wx_category  : flight category at segment midpoint
     wx_rank      : integer rank (0=VFR … 3=LIFR)
     voltage_kv   : nominal voltage (0 for off-ROW)
+    noise_score  : normalised population impact [0,1]; 0.0 until --landscan used
+    pop_sum      : raw population buffer sum; set by compute_population_scores()
     weight       : routing cost for Yen's algorithm
 
     Segments failing the wx_filter are excluded entirely.
@@ -274,7 +277,8 @@ def build_graph(
             voltage_kv=seg.voltage_kv,
             airspace_class=airspace_class,
             elev_gain_m=round(elev_gain_m, 1),
-            noise_score=0.0,    # Phase 4: populated by social.py
+            noise_score=0.0,    # Phase 4: overwritten by apply_weights() when pop_sum is set
+            pop_sum=0.0,        # raw population buffer sum; set by compute_population_scores()
             weight=cost,
         )
 
@@ -364,6 +368,10 @@ def find_routes(
             G[s.from_ident][s.to_ident].get("elev_gain_m", 0.0)
             for s in segments
         )
+        total_pop    = sum(
+            G[s.from_ident][s.to_ident].get("pop_sum", 0.0)
+            for s in segments
+        )
 
         routes.append(Route(
             rank=len(routes) + 1,
@@ -374,6 +382,7 @@ def find_routes(
             cost=round(cost, 2),
             class_e_time_min=round(class_e_time, 1),
             total_climb_m=round(total_climb, 0),
+            total_pop_affected=round(total_pop, 0),
         ))
 
     print(f"  [Router] {len(routes)} route(s) found  ({origin} → {destination})")
@@ -546,17 +555,18 @@ def _ray_cast_simple(lat: float, lon: float, ring) -> bool:
 
 def apply_weights(
     G: nx.DiGraph,
-    time_weight:               float = 1.0,
-    elev_weight:               float = 0.0,
-    noise_weight:              float = 0.0,
-    wx_filter:                 str   = "MVFR",
-    echo_penalty:              float = AIRSPACE_PENALTY["E"],
-    airspace_mode:             str   = "default",
-    exempt_coords:             list  = None,
-    exempt_radius_nm:          float = 25.0,
-    current_tfrs:              list  = None,   # live TFR list — overrides baked airspace_class
-    current_weather_zones:     list  = None,   # live weather exclusion zones (WeatherZone objects)
-    wx_zone_severity_threshold: str  = "IFR",  # minimum severity for hard wx-zone exclusion
+    time_weight:                float = 1.0,
+    elev_weight:                float = 0.0,
+    noise_weight:               float = 0.0,
+    cruise_kts:                 float = 120.0,
+    wx_filter:                  str   = "MVFR",
+    echo_penalty:               float = AIRSPACE_PENALTY["E"],
+    airspace_mode:              str   = "default",
+    exempt_coords:              list  = None,
+    exempt_radius_nm:           float = 25.0,
+    current_tfrs:               list  = None,
+    current_weather_zones:      list  = None,
+    wx_zone_severity_threshold: str   = "IFR",
 ) -> None:
     """
     Recompute the `weight` attribute on every edge from stored component costs.
@@ -567,8 +577,13 @@ def apply_weights(
     Parameters
     ----------
     time_weight               : λ_t — weight on ETE (default 1.0)
-    elev_weight               : λ_e — weight on elevation gain in metres.
-    noise_weight              : λ_n — stub; 0 until LandScan data (Phase 4)
+    elev_weight               : λ_e — weight on elevation gain in metres
+    noise_weight              : λ_n — population impact weight; activates
+                                when pop_sum data is present in graph
+    cruise_kts                : current cruise speed (kts); used to compute
+                                noise_score = log1p(pop_sum / cruise_kts).
+                                Changing this slider immediately shifts the
+                                normalised noise surface without a rebuild.
     wx_filter                 : VFR / MVFR / IFR / ALL
     echo_penalty              : equivalent-minute penalty for Class E airspace
     airspace_mode             : reserved
@@ -618,6 +633,35 @@ def apply_weights(
             )
             if zone_rank >= _threshold_rank:
                 _active_wx_zones.append(_wz)
+
+    # ── Noise score pre-computation (two-pass normalisation) ─────────────────
+    # Runs only when noise_weight > 0 AND pop_sum data has been baked into the
+    # graph via compute_population_scores() (indicated by pop_sum_max > 0).
+    #
+    # Pass 1: raw = log1p(pop_sum / cruise_kts) * voltage_multiplier(kv)
+    #   - Dividing by cruise_kts converts the spatial population count to a
+    #     time-domain exposure proxy: slower flight = more person-seconds.
+    #   - voltage_multiplier applies the transmission ROW discount.
+    #
+    # Pass 2: normalise to [0, 1] across all edges.
+    #   - Recomputed each call so cruise_kts changes take effect immediately
+    #     without a graph rebuild. Wire is fully exposed for design sweeps.
+    if noise_weight > 0.0 and G.graph.get("pop_sum_max", 0.0) > 0.0:
+        _raw_noise: dict[tuple, float] = {}
+        for _a, _b, _d in G.edges(data=True):
+            _ps  = _d.get("pop_sum", 0.0)
+            _kv  = _d.get("voltage_kv", 0.0)
+            _raw_noise[(_a, _b)] = (
+                math.log1p(_ps / max(cruise_kts, 1.0))
+                * voltage_multiplier(_kv)
+            )
+        _nvals = list(_raw_noise.values())
+        _nmin  = min(_nvals)
+        _nmax  = max(_nvals)
+        _nrng  = max(_nmax - _nmin, 1e-9)
+        for _a, _b, _d in G.edges(data=True):
+            _d["noise_score"] = (_raw_noise[(_a, _b)] - _nmin) / _nrng
+    # ─────────────────────────────────────────────────────────────────────────
 
     for a, b, data in G.edges(data=True):
         ac = data.get("airspace_class", "G")

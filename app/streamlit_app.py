@@ -87,8 +87,8 @@ _ELEV_SAMPLES  = 6
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Trailblazer", page_icon="🛰️", layout="wide")
-st.title("🛰️ Trailblazer — BVLOS Route Planner")
+st.set_page_config(page_title="Trailblazer", page_icon="🥾", layout="wide")
+st.title("🥾 Trailblazer — BVLOS Route Planner")
 
 # ── Graph loading (cached) ────────────────────────────────────────────────────
 
@@ -228,7 +228,7 @@ with st.sidebar:
     )
     show_airspace = st.checkbox("Show exclusion zones", value=True)
 
-    st.subheader("💉 Inject TFR")
+    st.subheader("🔴 Inject TFR")
     with st.expander("Define synthetic TFR"):
         st.caption("Edit `data/tfrs.json` to add permanent TFRs, or inject one below.")
         tfr_name = st.text_input("Name", "Ad hoc TFR")
@@ -729,18 +729,6 @@ def make_map(
                     tooltip=f'{zone["ident"]} · Class {zone["airspace"]}',
                 ).add_to(airspace_grp)
 
-        _now_utc = datetime.now(timezone.utc)
-        for tfr in airspace_ex.tfrs:
-            if tfr.end_utc and _now_utc > tfr.end_utc:
-                continue
-            if tfr.start_utc and _now_utc < tfr.start_utc:
-                continue
-            folium.Polygon(
-                locations=tfr.polygon,
-                color=IBM["red"], fill=True, fill_opacity=0.20, weight=2,
-                tooltip=f"TFR: {tfr.name}",
-            ).add_to(airspace_grp)
-
         from trailblazer.airspace.exclusion import _KDCA_LAT, _KDCA_LON, _SFRA_RADIUS_NM
         folium.Circle(
             [_KDCA_LAT, _KDCA_LON],
@@ -751,9 +739,26 @@ def make_map(
         ).add_to(airspace_grp)
         airspace_grp.add_to(m)
 
-    if weather_zones:
-        wx_zone_grp = folium.FeatureGroup("Weather Zones", show=True)
+    # ── TFRs — own group, always rendered regardless of airspace toggle ───
+    if airspace_ex and airspace_ex.tfrs:
+        tfr_grp  = folium.FeatureGroup("TFRs", show=True)
         _now_utc = datetime.now(timezone.utc)
+        for tfr in airspace_ex.tfrs:
+            if tfr.end_utc and _now_utc > tfr.end_utc:
+                continue
+            if tfr.start_utc and _now_utc < tfr.start_utc:
+                continue
+            folium.Polygon(
+                locations=tfr.polygon,
+                color=IBM["red"], fill=True, fill_opacity=0.25, weight=2.5,
+                tooltip=f"TFR: {tfr.name}",
+            ).add_to(tfr_grp)
+        tfr_grp.add_to(m)
+
+    if weather_zones:
+        wx_zone_grp  = folium.FeatureGroup("Weather Zones", show=True)
+        _now_utc     = datetime.now(timezone.utc)
+        _wz_rendered = 0
         for wz in weather_zones:
             if wz.start_utc and _now_utc < wz.start_utc:
                 continue
@@ -762,11 +767,13 @@ def make_map(
             color = WX_COLORS.get(wz.severity, IBM["teal"]) or IBM["teal"]
             folium.Polygon(
                 locations=wz.polygon,
-                color=color, fill=True, fill_opacity=0.20, weight=2,
+                color=color, fill=True, fill_opacity=0.25, weight=2.5,
                 dash_array="6 4",
                 tooltip=f"Wx: {wz.name} · {wz.severity} · {wz.hazard or '—'}",
             ).add_to(wx_zone_grp)
-        wx_zone_grp.add_to(m)
+            _wz_rendered += 1
+        if _wz_rendered:
+            wx_zone_grp.add_to(m)
 
     if gairmets:
         wx_grp = folium.FeatureGroup("G-AIRMETs", show=True)
